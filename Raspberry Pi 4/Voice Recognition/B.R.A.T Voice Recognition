@@ -1,0 +1,55 @@
+import pyaudio
+import numpy as np
+from edge_impulse_linux.audio import AudioImpulseRunner
+
+# Configurações
+FILE_MODEL = "/home/samuel/Documents/CODIGO_SOM/b.r.a.t.-voice-recognition-v1-linux-aarch64-v9-impulse-#4.eim"
+DEVICE_ID = 1
+HW_RATE = 48000
+CHANNELS = 2
+CHUNK_SIZE = 4800  # 0.1 segundos de áudio por leitura
+MODEL_INPUT_SIZE = 16000 # O que o modelo espera (1s a 16kHz)
+
+runner = AudioImpulseRunner(FILE_MODEL)
+
+try:
+    runner.init()
+    p = pyaudio.PyAudio()
+    
+    # Buffer de 16k amostras inicializado com zeros
+    sliding_window = np.zeros(MODEL_INPUT_SIZE, dtype=np.int16)
+
+    stream = p.open(format=pyaudio.paInt16, channels=CHANNELS, rate=HW_RATE,
+                    input=True, input_device_index=DEVICE_ID, frames_per_buffer=CHUNK_SIZE)
+
+    print("--- B.R.A.T. Ativo (Janela Deslizante) ---")
+
+    while True:
+        # 1. Lê apenas 0.1s de áudio
+        data = stream.read(CHUNK_SIZE, exception_on_overflow=False)
+        new_samples = np.frombuffer(data, dtype=np.int16)
+        
+        # 2. Converte para Mono e 16kHz (Resultado: 1600 amostras)
+        processed_chunk = new_samples[::2][::3]
+        
+        # 3. Atualiza a Janela Deslizante (Empurra o antigo, mete o novo no fim)
+        sliding_window = np.roll(sliding_window, -len(processed_chunk))
+        sliding_window[-len(processed_chunk):] = processed_chunk
+        
+        # 4. Classifica o buffer completo de 1 segundo
+        res = runner.classify(sliding_window.tolist())
+        
+        if "classification" in res["result"]:
+            # Filtra apenas resultados relevantes para não encher o terminal
+            predictions = res["result"]["classification"]
+            top_label = max(predictions, key=predictions.get)
+            top_score = predictions[top_label]
+
+            if top_score > 0.75:
+                print(f"Detectado: {top_label:10} | Confiança: {top_score*100:3.0f}%")
+
+except Exception as e:
+    print(f"Erro: {e}")
+finally:
+    if 'stream' in locals(): stream.close()
+    runner.stop()
