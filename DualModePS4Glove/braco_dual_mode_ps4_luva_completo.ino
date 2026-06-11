@@ -9,62 +9,68 @@
 //   - Luva envia por ESP-NOW
 //
 // Mapeamento da luva:
-//   - Fechar/abrir mao -> gripper
-//   - Inclinar para cima/baixo (pitch) -> servo de baixo + servo de cima
-//   - Inclinar esquerda/direita (roll) -> servo terceiro 360
+//   - Polegar -> gripper
+//   - Indicador + medio + anelar -> servo de cima
+//   - Inclinar para cima/baixo (pitch) -> servo de baixo
+//   - Inclinar esquerda/direita (roll) -> servo terceiro
 //
 // Mapeamento PS4:
 //   - Triangle -> modo LUVA
 //   - Square   -> modo COMANDO
 //   - Circle   -> abre/fecha gripper
+//   - Cross    -> volta o braco a posicao inicial
 //   - Left stick Y  -> servo de baixo
 //   - Right stick Y -> servo de cima
-//   - D-pad left/right -> servo terceiro 360
-//   - PS -> desliga comando e para o servo 360
+//   - D-pad left/right -> servo terceiro
+//   - PS -> desliga comando
 // =========================
 
 #define LED_PIN 2
 
 const int PIN_SERVO_BAIXO    = 17;
 const int PIN_SERVO_CIMA     = 18;
-const int PIN_SERVO_TERCEIRO = 19;  // servo 360 continuo
+const int PIN_SERVO_TERCEIRO = 19;
 const int PIN_SERVO_GRIPPER  = 21;
 
 const int ANGULO_CENTRO_BAIXO   = 90;
 const int ANGULO_CENTRO_CIMA    = 90;
+const int ANGULO_CENTRO_TERCEIRO = 90;
 const int ANGULO_ABERTO_GRIPPER = 0;
 const int ANGULO_FECHADO_GRIPPER = 180;
 
 const int ANGULO_MIN_BAIXO   = 10;
 const int ANGULO_MAX_BAIXO   = 170;
+const int ANGULO_ABERTO_CIMA_GLOVE = 20;
+const int ANGULO_FECHADO_CIMA_GLOVE = 160;
 const int ANGULO_MIN_CIMA    = 10;
 const int ANGULO_MAX_CIMA    = 170;
+const int ANGULO_MIN_TERCEIRO = 10;
+const int ANGULO_MAX_TERCEIRO = 170;
 const int ANGULO_MIN_GRIPPER = 0;
 const int ANGULO_MAX_GRIPPER = 180;
 
-const int PULSE_STOP_TERCEIRO = 1500;
-const int PULSE_MIN_TERCEIRO  = 500;
-const int PULSE_MAX_TERCEIRO  = 2500;
-
 const float SUAVIZACAO_POS = 0.025f;
-const float SUAVIZACAO_GRIPPER = 0.06f;
-const float SUAVIZACAO_TERCEIRO = 0.18f;
+const float SUAVIZACAO_POS_GLOVE = 0.04f;
+const float SUAVIZACAO_GRIPPER = 0.20f;
+const float SUAVIZACAO_TERCEIRO_CMD = 0.025f;
+const float SUAVIZACAO_TERCEIRO_GLOVE = 0.04f;
 
 const int DEADZONE_CMD = 50;
-const int RANGE_CMD_TERCEIRO = 240;
+const int PASSO_CMD_MIN = 1;
+const int PASSO_CMD_MAX = 3;
+const int PASSO_TERCEIRO_CMD = 2;
 
 const float PITCH_MAX_DEG = 35.0f;
 const float ROLL_MAX_DEG  = 35.0f;
 const float PITCH_DEADZONE_DEG = 4.0f;
-const float ROLL_DEADZONE_DEG  = 5.0f;
-const int RANGE_TERCEIRO_GLOVE = 220;
+const float ROLL_DEADZONE_DEG  = 8.0f;
 const unsigned long GLOVE_TIMEOUT_MS = 400;
 
 // Se algum eixo estiver invertido, muda aqui para true.
 const bool REVERSE_BAIXO_FROM_PITCH = false;
-const bool REVERSE_CIMA_FROM_PITCH  = true;
-const bool REVERSE_TERCEIRO_FROM_ROLL = false;
-const bool REVERSE_GRIPPER_FROM_HAND = false;
+const bool REVERSE_TERCEIRO_FROM_ROLL = true;
+const bool REVERSE_GRIPPER_FROM_HAND = true;
+const bool REVERSE_CIMA_FROM_FINGERS = true;
 
 Servo servoBaixo;
 Servo servoCima;
@@ -79,13 +85,14 @@ enum ControlMode {
 };
 
 struct __attribute__((packed)) GlovePacket {
-  uint8_t avgPct;      // 0 aberto, 100 fechado
+  uint8_t gripperPct;  // polegar
+  uint8_t cimaPct;     // indicador + medio + anelar
   int16_t pitchDeg10;  // graus * 10
   int16_t rollDeg10;   // graus * 10
   uint8_t seq;
 };
 
-volatile GlovePacket latestGlove = {0, 0, 0, 0};
+volatile GlovePacket latestGlove = {0, 0, 0, 0, 0};
 volatile bool glovePacketArrived = false;
 volatile unsigned long lastGlovePacketMs = 0;
 volatile unsigned long glovePacketCount = 0;
@@ -102,12 +109,12 @@ bool prevPS = false;
 float posAtualBaixo = ANGULO_CENTRO_BAIXO;
 float posAtualCima = ANGULO_CENTRO_CIMA;
 float posAtualGripper = ANGULO_ABERTO_GRIPPER;
-float pulseAtualTerceiro = PULSE_STOP_TERCEIRO;
+float anguloAtualTerceiro = ANGULO_CENTRO_TERCEIRO;
 
 int alvoBaixo = ANGULO_CENTRO_BAIXO;
 int alvoCima = ANGULO_CENTRO_CIMA;
 int alvoGripper = ANGULO_ABERTO_GRIPPER;
-int alvoPulseTerceiro = PULSE_STOP_TERCEIRO;
+int alvoAnguloTerceiro = ANGULO_CENTRO_TERCEIRO;
 
 unsigned long lastDebugMs = 0;
 
@@ -131,32 +138,29 @@ int mapPctToAngle(uint8_t pct, int openAngle, int closedAngle, bool reverse) {
   return angle;
 }
 
-int mapPitchToAngle(float pitchDeg, int centerAngle, int travelAngle, bool reverse, int minAngle, int maxAngle) {
-  pitchDeg = applyDeadzone(pitchDeg, PITCH_DEADZONE_DEG);
-  float norm = clampf(pitchDeg / PITCH_MAX_DEG, -1.0f, 1.0f);
+int mapAxisToAngle(float value, float maxValue, float deadzone,
+                   int centerAngle, int travelAngle, bool reverse,
+                   int minAngle, int maxAngle) {
+  value = applyDeadzone(value, deadzone);
+  float norm = clampf(value / maxValue, -1.0f, 1.0f);
   if (reverse) norm = -norm;
   int angle = (int)roundf(centerAngle + norm * travelAngle);
   return clampi(angle, minAngle, maxAngle);
 }
 
-int mapRollToPulse(float rollDeg, bool reverse) {
-  rollDeg = applyDeadzone(rollDeg, ROLL_DEADZONE_DEG);
-  float norm = clampf(rollDeg / ROLL_MAX_DEG, -1.0f, 1.0f);
-  if (reverse) norm = -norm;
-  int pulse = (int)roundf(PULSE_STOP_TERCEIRO + norm * RANGE_TERCEIRO_GLOVE);
-  return clampi(pulse, PULSE_MIN_TERCEIRO, PULSE_MAX_TERCEIRO);
-}
-
 void applyServoOutputs() {
-  posAtualBaixo += (alvoBaixo - posAtualBaixo) * SUAVIZACAO_POS;
-  posAtualCima += (alvoCima - posAtualCima) * SUAVIZACAO_POS;
+  float suavizacaoPosAtual = (controlMode == MODE_GLOVE) ? SUAVIZACAO_POS_GLOVE : SUAVIZACAO_POS;
+  float suavizacaoTerceiroAtual = (controlMode == MODE_GLOVE) ? SUAVIZACAO_TERCEIRO_GLOVE : SUAVIZACAO_TERCEIRO_CMD;
+
+  posAtualBaixo += (alvoBaixo - posAtualBaixo) * suavizacaoPosAtual;
+  posAtualCima += (alvoCima - posAtualCima) * suavizacaoPosAtual;
   posAtualGripper += (alvoGripper - posAtualGripper) * SUAVIZACAO_GRIPPER;
-  pulseAtualTerceiro += (alvoPulseTerceiro - pulseAtualTerceiro) * SUAVIZACAO_TERCEIRO;
+  anguloAtualTerceiro += (alvoAnguloTerceiro - anguloAtualTerceiro) * suavizacaoTerceiroAtual;
 
   servoBaixo.write((int)roundf(posAtualBaixo));
   servoCima.write((int)roundf(posAtualCima));
   servoGripper.write((int)roundf(posAtualGripper));
-  servoTerceiro.writeMicroseconds((int)roundf(pulseAtualTerceiro));
+  servoTerceiro.write((int)roundf(anguloAtualTerceiro));
 }
 
 #if __has_include(<esp_arduino_version.h>)
@@ -215,33 +219,41 @@ void onDisconnectedController(ControllerPtr ctl) {
       break;
     }
   }
-  if (controlMode == MODE_CONTROLLER) {
-    alvoPulseTerceiro = PULSE_STOP_TERCEIRO;
-  }
 }
 
 void setMode(ControlMode newMode) {
   if (controlMode == newMode) return;
   controlMode = newMode;
   Serial.printf("[MODO] %s\n", controlMode == MODE_GLOVE ? "LUVA" : "COMANDO");
-  alvoPulseTerceiro = PULSE_STOP_TERCEIRO;
 }
 
 void updateTargetsFromGlove() {
   unsigned long age = millis() - lastGlovePacketMs;
   if (!glovePacketArrived || age > GLOVE_TIMEOUT_MS) {
-    alvoPulseTerceiro = PULSE_STOP_TERCEIRO;
     return;
   }
 
-  uint8_t avgPct = latestGlove.avgPct;
+  uint8_t gripperPct = latestGlove.gripperPct;
+  uint8_t cimaPct = latestGlove.cimaPct;
   float pitchDeg = latestGlove.pitchDeg10 / 10.0f;
   float rollDeg = latestGlove.rollDeg10 / 10.0f;
 
-  alvoGripper = mapPctToAngle(avgPct, ANGULO_ABERTO_GRIPPER, ANGULO_FECHADO_GRIPPER, REVERSE_GRIPPER_FROM_HAND);
-  alvoBaixo = mapPitchToAngle(pitchDeg, ANGULO_CENTRO_BAIXO, 55, REVERSE_BAIXO_FROM_PITCH, ANGULO_MIN_BAIXO, ANGULO_MAX_BAIXO);
-  alvoCima = mapPitchToAngle(pitchDeg, ANGULO_CENTRO_CIMA, 45, REVERSE_CIMA_FROM_PITCH, ANGULO_MIN_CIMA, ANGULO_MAX_CIMA);
-  alvoPulseTerceiro = mapRollToPulse(rollDeg, REVERSE_TERCEIRO_FROM_ROLL);
+  alvoGripper = mapPctToAngle(gripperPct,
+                              ANGULO_ABERTO_GRIPPER,
+                              ANGULO_FECHADO_GRIPPER,
+                              REVERSE_GRIPPER_FROM_HAND);
+  alvoCima = mapPctToAngle(cimaPct,
+                           ANGULO_ABERTO_CIMA_GLOVE,
+                           ANGULO_FECHADO_CIMA_GLOVE,
+                           REVERSE_CIMA_FROM_FINGERS);
+  alvoBaixo = mapAxisToAngle(pitchDeg, PITCH_MAX_DEG, PITCH_DEADZONE_DEG,
+                             ANGULO_CENTRO_BAIXO, 75,
+                             REVERSE_BAIXO_FROM_PITCH,
+                             ANGULO_MIN_BAIXO, ANGULO_MAX_BAIXO);
+  alvoAnguloTerceiro = mapAxisToAngle(rollDeg, ROLL_MAX_DEG, ROLL_DEADZONE_DEG,
+                                      ANGULO_CENTRO_TERCEIRO, 75,
+                                      REVERSE_TERCEIRO_FROM_ROLL,
+                                      ANGULO_MIN_TERCEIRO, ANGULO_MAX_TERCEIRO);
 }
 
 void updateTargetsFromController(ControllerPtr ctl) {
@@ -251,17 +263,34 @@ void updateTargetsFromController(ControllerPtr ctl) {
   if (abs(leftY) < DEADZONE_CMD) leftY = 0;
   if (abs(rightY) < DEADZONE_CMD) rightY = 0;
 
-  alvoBaixo = (leftY == 0) ? ANGULO_CENTRO_BAIXO : map(leftY, -512, 512, ANGULO_MIN_BAIXO, ANGULO_MAX_BAIXO);
-  alvoCima = (rightY == 0) ? ANGULO_CENTRO_CIMA : map(rightY, -512, 512, ANGULO_MIN_CIMA, ANGULO_MAX_CIMA);
+  // Controlo incremental: ao largar os analogicos conserva a posicao.
+  if (leftY != 0) {
+    int step = map(abs(leftY), DEADZONE_CMD, 512, PASSO_CMD_MIN, PASSO_CMD_MAX);
+    alvoBaixo += (leftY > 0) ? step : -step;
+    alvoBaixo = clampi(alvoBaixo, ANGULO_MIN_BAIXO, ANGULO_MAX_BAIXO);
+  }
+  if (rightY != 0) {
+    int step = map(abs(rightY), DEADZONE_CMD, 512, PASSO_CMD_MIN, PASSO_CMD_MAX);
+    alvoCima += (rightY > 0) ? step : -step;
+    alvoCima = clampi(alvoCima, ANGULO_MIN_CIMA, ANGULO_MAX_CIMA);
+  }
 
   uint8_t dpad = ctl->dpad();
   if (dpad & 0x02) {
-    alvoPulseTerceiro = PULSE_STOP_TERCEIRO - RANGE_CMD_TERCEIRO;
+    alvoAnguloTerceiro -= PASSO_TERCEIRO_CMD;
   } else if (dpad & 0x01) {
-    alvoPulseTerceiro = PULSE_STOP_TERCEIRO + RANGE_CMD_TERCEIRO;
-  } else {
-    alvoPulseTerceiro = PULSE_STOP_TERCEIRO;
+    alvoAnguloTerceiro += PASSO_TERCEIRO_CMD;
   }
+  alvoAnguloTerceiro = clampi(alvoAnguloTerceiro, ANGULO_MIN_TERCEIRO, ANGULO_MAX_TERCEIRO);
+}
+
+void resetArmPose() {
+  alvoBaixo = ANGULO_CENTRO_BAIXO;
+  alvoCima = ANGULO_CENTRO_CIMA;
+  alvoGripper = ANGULO_ABERTO_GRIPPER;
+  alvoAnguloTerceiro = ANGULO_CENTRO_TERCEIRO;
+  gripperAberto = true;
+  Serial.println("Braco a voltar a posicao inicial");
 }
 
 void processGamepad(ControllerPtr ctl) {
@@ -272,9 +301,7 @@ void processGamepad(ControllerPtr ctl) {
   bool psPressed = (ctl->miscButtons() & 0x04);
 
   if (crossPressed && !prevCross) {
-    ledState = !ledState;
-    digitalWrite(LED_PIN, ledState ? HIGH : LOW);
-    Serial.printf("LED %s\n", ledState ? "ON" : "OFF");
+    resetArmPose();
   }
 
   if (circlePressed && !prevCircle) {
@@ -292,7 +319,6 @@ void processGamepad(ControllerPtr ctl) {
   }
 
   if (psPressed && !prevPS) {
-    alvoPulseTerceiro = PULSE_STOP_TERCEIRO;
     ctl->disconnect();
   }
 
@@ -339,12 +365,12 @@ void setup() {
 
   servoBaixo.attach(PIN_SERVO_BAIXO, 500, 2500);
   servoCima.attach(PIN_SERVO_CIMA, 500, 2500);
-  servoTerceiro.attach(PIN_SERVO_TERCEIRO, PULSE_MIN_TERCEIRO, PULSE_MAX_TERCEIRO);
+  servoTerceiro.attach(PIN_SERVO_TERCEIRO, 500, 2500);
   servoGripper.attach(PIN_SERVO_GRIPPER, 400, 2200);
 
   servoBaixo.write(ANGULO_CENTRO_BAIXO);
   servoCima.write(ANGULO_CENTRO_CIMA);
-  servoTerceiro.writeMicroseconds(PULSE_STOP_TERCEIRO);
+  servoTerceiro.write(ANGULO_CENTRO_TERCEIRO);
   servoGripper.write(ANGULO_ABERTO_GRIPPER);
   delay(700);
 
@@ -370,8 +396,6 @@ void loop() {
 
   if (controlMode == MODE_GLOVE) {
     updateTargetsFromGlove();
-  } else if (getAnyConnectedGamepad() == nullptr) {
-    alvoPulseTerceiro = PULSE_STOP_TERCEIRO;
   }
 
   applyServoOutputs();
@@ -379,15 +403,16 @@ void loop() {
   if (millis() - lastDebugMs >= 300) {
     float pitchDeg = latestGlove.pitchDeg10 / 10.0f;
     float rollDeg = latestGlove.rollDeg10 / 10.0f;
-    Serial.printf("DBG mode=%s gripPct=%u pitch=%.1f roll=%.1f packets=%lu | baixo=%d cima=%d terceiro=%d gripper=%d\n",
+    Serial.printf("DBG mode=%s gripPct=%u cimaPct=%u pitch=%.1f roll=%.1f packets=%lu | baixo=%d cima=%d terceiro=%d gripper=%d\n",
                   controlMode == MODE_GLOVE ? "LUVA" : "COMANDO",
-                  latestGlove.avgPct,
+                  latestGlove.gripperPct,
+                  latestGlove.cimaPct,
                   pitchDeg,
                   rollDeg,
                   glovePacketCount,
                   alvoBaixo,
                   alvoCima,
-                  alvoPulseTerceiro,
+                  alvoAnguloTerceiro,
                   alvoGripper);
     lastDebugMs = millis();
   }

@@ -16,7 +16,8 @@ const int CLOSED_V[4] = {1079, 714, 789, 753};
 uint8_t receiverMac[] = {0x08, 0xB6, 0x1F, 0xEF, 0x8D, 0xF8};
 
 struct __attribute__((packed)) GlovePacket {
-  uint8_t avgPct;      // 0 aberto, 100 fechado
+  uint8_t gripperPct;  // polegar
+  uint8_t cimaPct;     // indicador + medio + anelar
   int16_t pitchDeg10;  // graus * 10
   int16_t rollDeg10;   // graus * 10
   uint8_t seq;
@@ -28,11 +29,18 @@ unsigned long lastSendMs = 0;
 unsigned long lastPrintMs = 0;
 volatile esp_now_send_status_t lastSendStatus = ESP_NOW_SEND_SUCCESS;
 
-float filteredAvg = 0.0f;
+float filteredGripper = 0.0f;
+float filteredCima = 0.0f;
 float filteredPitch = 0.0f;
 float filteredRoll = 0.0f;
 bool filterInitialized = false;
 uint8_t seqCounter = 0;
+float pitchOffsetDeg = 0.0f;
+float rollOffsetDeg = 0.0f;
+float imuPitchDeg = 0.0f;
+float imuRollDeg = 0.0f;
+unsigned long lastImuUs = 0;
+bool imuOrientationInitialized = false;
 
 int clampi(int x, int a, int b) {
   return x < a ? a : (x > b ? b : x);
@@ -102,7 +110,7 @@ void setupImu() {
   mpu.setFilterBandwidth(MPU6050_BAND_21_HZ);
 }
 
-void readPitchRollDeg(float &pitchDeg, float &rollDeg) {
+void readMotion(float &pitchDeg, float &rollDeg) {
   sensors_event_t a, g, temp;
   mpu.getEvent(&a, &g, &temp);
 
@@ -110,11 +118,56 @@ void readPitchRollDeg(float &pitchDeg, float &rollDeg) {
   float ay = a.acceleration.y;
   float az = a.acceleration.z;
 
-  rollDeg = atan2f(ay, az) * 180.0f / PI;
-  pitchDeg = atan2f(-ax, sqrtf(ay * ay + az * az)) * 180.0f / PI;
+  float accelRollDeg = atan2f(ay, sqrtf(ax * ax + az * az)) * 180.0f / PI;
+  float accelPitchDeg = atan2f(-ax, sqrtf(ay * ay + az * az)) * 180.0f / PI;
+
+  unsigned long nowUs = micros();
+  float dt = (lastImuUs == 0) ? 0.0f : (nowUs - lastImuUs) / 1000000.0f;
+  lastImuUs = nowUs;
+
+  if (!imuOrientationInitialized || dt <= 0.0f || dt > 0.1f) {
+    imuPitchDeg = accelPitchDeg;
+    imuRollDeg = accelRollDeg;
+    imuOrientationInitialized = true;
+  } else {
+    float gyroPitchDegS = g.gyro.y * 180.0f / PI;
+    float gyroRollDegS = g.gyro.x * 180.0f / PI;
+
+    imuPitchDeg = 0.98f * (imuPitchDeg + gyroPitchDegS * dt) + 0.02f * accelPitchDeg;
+    imuRollDeg = 0.98f * (imuRollDeg + gyroRollDegS * dt) + 0.02f * accelRollDeg;
+  }
+
+  pitchDeg = imuPitchDeg;
+  rollDeg = imuRollDeg;
 
   pitchDeg = clampf(pitchDeg, -90.0f, 90.0f);
   rollDeg = clampf(rollDeg, -90.0f, 90.0f);
+}
+
+void calibrateNeutralPose() {
+  const int samples = 40;
+  float sumPitch = 0.0f;
+  float sumRoll = 0.0f;
+
+  Serial.println("Calibrar neutro da luva... mantem a mao quieta");
+  delay(500);
+
+  for (int i = 0; i < samples; i++) {
+    float pitchDeg = 0.0f;
+    float rollDeg = 0.0f;
+    readMotion(pitchDeg, rollDeg);
+    sumPitch += pitchDeg;
+    sumRoll += rollDeg;
+    delay(20);
+  }
+
+  pitchOffsetDeg = sumPitch / samples;
+  rollOffsetDeg = sumRoll / samples;
+
+  Serial.print("Neutro pitch=");
+  Serial.print(pitchOffsetDeg, 1);
+  Serial.print(" | roll=");
+  Serial.println(rollOffsetDeg, 1);
 }
 
 void setup() {
@@ -122,12 +175,13 @@ void setup() {
   delay(1000);
 
   Serial.println("\nBOOT OK - LUVA TX BRACO COMPLETO");
-  Serial.println("BUILD 2026-06-04 PITCH ROLL GRIPPER");
+  Serial.println("BUILD 2026-06-11 FLEX DIVIDIDO");
 
   analogReadResolution(12);
   analogSetAttenuation(ADC_11db);
 
   setupImu();
+  calibrateNeutralPose();
   setupEspNow();
 
   Serial.print("MAC destino do braco: ");
@@ -140,32 +194,38 @@ void setup() {
 void loop() {
   int raw[4];
   uint8_t pct[4];
-  int sumPct = 0;
 
   readFlexRaw(raw);
 
   for (int i = 0; i < 4; i++) {
     pct[i] = flexRawToPct(raw[i], OPEN_V[i], CLOSED_V[i]);
-    sumPct += pct[i];
   }
 
-  int avgPct = sumPct / 4;
+  int gripperPct = pct[0];
+  int cimaPct = (pct[1] + pct[2] + pct[3]) / 3;
   float pitchDeg = 0.0f;
   float rollDeg = 0.0f;
-  readPitchRollDeg(pitchDeg, rollDeg);
+  readMotion(pitchDeg, rollDeg);
+  pitchDeg -= pitchOffsetDeg;
+  rollDeg -= rollOffsetDeg;
 
   if (!filterInitialized) {
-    filteredAvg = avgPct;
+    filteredGripper = gripperPct;
+    filteredCima = cimaPct;
     filteredPitch = pitchDeg;
     filteredRoll = rollDeg;
     filterInitialized = true;
   } else {
-    filteredAvg = 0.45f * filteredAvg + 0.55f * avgPct;
-    filteredPitch = 0.88f * filteredPitch + 0.12f * pitchDeg;
-    filteredRoll = 0.88f * filteredRoll + 0.12f * rollDeg;
+    filteredGripper = 0.45f * filteredGripper + 0.55f * gripperPct;
+    filteredCima = 0.75f * filteredCima + 0.25f * cimaPct;
+    filteredPitch = 0.82f * filteredPitch + 0.18f * pitchDeg;
+    filteredRoll = 0.90f * filteredRoll + 0.10f * rollDeg;
   }
 
-  packet.avgPct = (uint8_t)clampi((int)roundf(filteredAvg), 0, 100);
+  packet.gripperPct =
+      (uint8_t)clampi((int)roundf(filteredGripper), 0, 100);
+  packet.cimaPct =
+      (uint8_t)clampi((int)roundf(filteredCima), 0, 100);
   packet.pitchDeg10 = (int16_t)roundf(filteredPitch * 10.0f);
   packet.rollDeg10 = (int16_t)roundf(filteredRoll * 10.0f);
   packet.seq = seqCounter++;
@@ -184,10 +244,10 @@ void loop() {
       Serial.print((int)pct[i]);
       if (i < 3) Serial.print(",");
     }
-    Serial.print(" | media=");
-    Serial.print(avgPct);
-    Serial.print(" | filtrada=");
-    Serial.print((int)packet.avgPct);
+    Serial.print(" | gripper=");
+    Serial.print((int)packet.gripperPct);
+    Serial.print(" | cima=");
+    Serial.print((int)packet.cimaPct);
     Serial.print(" | pitch=");
     Serial.print(packet.pitchDeg10 / 10.0f, 1);
     Serial.print(" | roll=");
